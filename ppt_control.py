@@ -17,8 +17,10 @@ WPS / PowerPoint 幻灯片控制 API 服务 (FastAPI)
     - POST /api/ppt/start           启动幻灯片放映
     - GET  /api/ppt/is_ready        检查是否已进入放映模式
     - GET  /api/ppt/current         获取当前幻灯片位置
-    - POST /api/ppt/next            切换到下一张幻灯片
-    - POST /api/ppt/prev            切换到上一张幻灯片
+    - POST /api/ppt/next            下一步（触发动画或翻页）
+    - POST /api/ppt/prev            上一步（触发动画或翻页）
+    - POST /api/ppt/next_slide      下一页（跳过动画直接翻页）
+    - POST /api/ppt/prev_slide      上一页（跳过动画直接翻页）
     - POST /api/ppt/goto            跳转到指定幻灯片
     - POST /api/ppt/blank           黑屏/白屏/恢复
     - POST /api/ppt/auto_play       根据时间线自动翻页（参数: timeline, lead_time, auto_exit）
@@ -825,13 +827,22 @@ def is_ready():
           description="在放映模式下切换到下一张幻灯片。必须先启动放映模式。")
 def next_slide():
     """切换到下一张幻灯片"""
+    global slide_show
     if not ensure_slideshow():
         raise HTTPException(status_code=400, detail="放映未启动")
     try:
-        slide_show.View.Next()
         pos = slide_show.View.CurrentShowPosition
-        return ResponseModel(code=20000, message=f"切换到第 {pos} 张")
+        total = presentation.Slides.Count
+        if pos >= total:
+            return ResponseModel(code=20000, message=f"已是最后一张 (第 {pos} 张, 共 {total} 张)")
+        slide_show.View.Next()
+        new_pos = slide_show.View.CurrentShowPosition
+        return ResponseModel(code=20000, message=f"切换到第 {new_pos} 张")
     except Exception as e:
+        # 放映可能已被PPT自动退出
+        if not ensure_slideshow():
+            slide_show = None
+            raise HTTPException(status_code=400, detail="放映已结束（已到最后一张）")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -846,6 +857,41 @@ def prev_slide():
         slide_show.View.Previous()
         pos = slide_show.View.CurrentShowPosition
         return ResponseModel(code=20000, message=f"返回到第 {pos} 张")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/ppt/next_slide", response_model=ResponseModel, tags=["放映控制"],
+          summary="下一页（跳过动画）",
+          description="直接跳转到下一张幻灯片，跳过当前页所有未播放的动画。已是最后一张时不会退出放映。")
+def next_slide_skip():
+    """下一页（跳过动画）"""
+    if not ensure_slideshow():
+        raise HTTPException(status_code=400, detail="放映未启动")
+    try:
+        pos = slide_show.View.CurrentShowPosition
+        total = presentation.Slides.Count
+        if pos >= total:
+            return ResponseModel(code=20000, message=f"已是最后一张 (第 {pos} 张, 共 {total} 张)")
+        slide_show.View.GotoSlide(pos + 1)
+        return ResponseModel(code=20000, message=f"跳转到第 {pos + 1} 张")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/ppt/prev_slide", response_model=ResponseModel, tags=["放映控制"],
+          summary="上一页（跳过动画）",
+          description="直接跳转到上一张幻灯片，跳过所有动画。已是第一张时返回提示。")
+def prev_slide_skip():
+    """上一页（跳过动画）"""
+    if not ensure_slideshow():
+        raise HTTPException(status_code=400, detail="放映未启动")
+    try:
+        pos = slide_show.View.CurrentShowPosition
+        if pos <= 1:
+            return ResponseModel(code=20000, message=f"已是第一张 (第 {pos} 张)")
+        slide_show.View.GotoSlide(pos - 1)
+        return ResponseModel(code=20000, message=f"跳转到第 {pos - 1} 张")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1249,8 +1295,10 @@ if __name__ == "__main__":
         print("  - POST /api/ppt/start          # 启动幻灯片放映")
         print("  - GET  /api/ppt/is_ready       # 检查是否已进入放映模式")
         print("  - GET  /api/ppt/current        # 获取当前幻灯片位置")
-        print("  - POST /api/ppt/next           # 切换到下一张幻灯片")
-        print("  - POST /api/ppt/prev           # 切换到上一张幻灯片")
+        print("  - POST /api/ppt/next           # 下一步（触发动画或翻页）")
+        print("  - POST /api/ppt/prev           # 上一步（触发动画或翻页）")
+        print("  - POST /api/ppt/next_slide     # 下一页（跳过动画直接翻页）")
+        print("  - POST /api/ppt/prev_slide     # 上一页（跳过动画直接翻页）")
         print("  - POST /api/ppt/goto           # 跳转到指定幻灯片（参数: slide）")
         print("  - POST /api/ppt/blank          # 黑屏/白屏/恢复（参数: action='black'/'white'/'resume'）")
         print("  - POST /api/ppt/auto_play      # 根据时间线自动翻页（参数: timeline, lead_time, auto_exit）")

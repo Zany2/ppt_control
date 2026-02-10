@@ -78,13 +78,19 @@ python ppt_control.py
 | POST | `/api/ppt/start` | 启动幻灯片放映 |
 | GET | `/api/ppt/is_ready` | 检查是否已进入放映模式 |
 | GET | `/api/ppt/current` | 获取当前幻灯片位置 |
-| POST | `/api/ppt/next` | 下一张幻灯片 |
-| POST | `/api/ppt/prev` | 上一张幻灯片 |
+| POST | `/api/ppt/next` | 下一步（触发动画或翻页） |
+| POST | `/api/ppt/prev` | 上一步（触发动画或翻页） |
+| POST | `/api/ppt/next_slide` | 下一页（跳过动画直接翻页） |
+| POST | `/api/ppt/prev_slide` | 上一页（跳过动画直接翻页） |
 | POST | `/api/ppt/goto` | 跳转到指定幻灯片 |
 | POST | `/api/ppt/blank` | 黑屏/白屏/恢复 |
 | POST | `/api/ppt/auto_play` | 根据时间线自动翻页 |
 | POST | `/api/ppt/stop_auto_play` | 停止自动翻页 |
 | POST | `/api/ppt/exit_show` | 退出放映模式 |
+
+> **next/prev 与 next_slide/prev_slide 的区别：**
+> - `next` / `prev` 模拟鼠标点击，会逐步触发幻灯片上的动画效果，所有动画播完后才翻页
+> - `next_slide` / `prev_slide` 跳过所有动画，直接跳转到上/下一张幻灯片
 
 ### 媒体信息
 
