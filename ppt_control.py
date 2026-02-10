@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # @Time    : 2025/12/19
-# @File    : ppt_fastapi.py
+# @File    : ppt_control.py
 # @Description : WPS / PowerPoint 控制 API 服务（FastAPI 版本）
 
 """
@@ -13,12 +13,16 @@ WPS / PowerPoint 幻灯片控制 API 服务 (FastAPI)
     - GET  /api/ppt/app_info        获取当前运行软件信息
     - GET  /api/status              获取当前系统整体状态
     - POST /api/ppt/open            打开指定 PPT 文件
+    - POST /api/ppt/close           关闭演示文稿（不关闭应用）
     - POST /api/ppt/start           启动幻灯片放映
     - GET  /api/ppt/is_ready        检查是否已进入放映模式
+    - GET  /api/ppt/current         获取当前幻灯片位置
     - POST /api/ppt/next            切换到下一张幻灯片
     - POST /api/ppt/prev            切换到上一张幻灯片
     - POST /api/ppt/goto            跳转到指定幻灯片
+    - POST /api/ppt/blank           黑屏/白屏/恢复
     - POST /api/ppt/auto_play       根据时间线自动翻页（参数: timeline, lead_time, auto_exit）
+    - POST /api/ppt/stop_auto_play  停止自动翻页
     - POST /api/ppt/exit_show       退出放映模式
     - POST /api/ppt/exit_app        优雅关闭 WPS / PowerPoint 应用（通过COM）
     - POST /api/ppt/force_close     强制关闭 WPS / PowerPoint 应用进程
@@ -35,7 +39,7 @@ from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
-from typing import Optional, List, Union, Any
+from typing import Optional, List, Union
 from pathlib import Path
 import traceback
 import atexit
@@ -53,8 +57,16 @@ class SerializationMiddleware(BaseHTTPMiddleware):
     说明:
         由于COM对象具有线程亲和性（只能在创建它的线程中使用），
         此中间件确保所有请求串行处理，避免多线程访问COM对象导致的错误。
+        部分不涉及COM操作的接口（如停止自动翻页）可跳过串行化。
     """
+    # 不需要串行化的路径（不涉及COM操作，仅操作内存标志位）
+    SKIP_PATHS = {"/api/ppt/stop_auto_play"}
+
     async def dispatch(self, request: Request, call_next):
+        if request.url.path in self.SKIP_PATHS:
+            response = await call_next(request)
+            return response
+
         # 获取信号量，确保同一时间只有一个请求在处理
         _request_semaphore.acquire()
         try:
@@ -89,24 +101,66 @@ class AutoPlayRequest(BaseModel):
     auto_exit: bool = Field(default=False, description="是否自动退出")
 
 
+class BlankRequest(BaseModel):
+    """黑屏/白屏请求模型"""
+    action: str = Field(default="black", description="操作类型: black(黑屏), white(白屏), resume(恢复正常)")
+
+
 class ResponseModel(BaseModel):
     """标准响应模型"""
-    status: str = Field(..., description="响应状态: success 或 error")
-    message: Optional[str] = Field(None, description="响应消息")
-    data: Optional[Any] = Field(None, description="响应数据")
+    code: int = Field(..., description="响应状态码: 20000 表示成功, 50000 表示失败")
+    message: Optional[str] = Field(None, description="响应消息（成功时为操作结果描述，失败时为错误提示信息）")
 
 
 # ==========================================================
 # 全局变量定义
 # ==========================================================
+
+# Swagger 标签分组定义
+tags_metadata = [
+    {
+        "name": "应用管理",
+        "description": "WPS / PowerPoint 应用的启动、关闭、状态查询等管理操作",
+    },
+    {
+        "name": "文件操作",
+        "description": "PPT 演示文稿文件的打开操作",
+    },
+    {
+        "name": "放映控制",
+        "description": "幻灯片放映模式的启动、翻页、跳转、自动播放、退出等控制操作",
+    },
+    {
+        "name": "媒体信息",
+        "description": "获取当前幻灯片中的媒体资源（视频/音频）信息",
+    },
+]
+
 app = FastAPI(
     title="WPS / PowerPoint 控制 API",
-    description="用于远程控制 WPS 演示或 PowerPoint 的 API 服务",
-    version="2.0.0"
+    description=(
+        "用于远程控制 WPS 演示或 Microsoft PowerPoint 的 HTTP API 服务。\n\n"
+        "通过 COM 自动化接口操控本地 WPS/PowerPoint 应用，支持打开文件、启动放映、"
+        "翻页、跳转、自动翻页、退出放映等功能，适用于演讲、演出等场景下的自动化幻灯片控制。\n\n"
+        "**响应格式说明：**\n"
+        "- `code`: 状态码，`20000` 表示成功，`50000` 表示失败\n"
+        "- `message`: 操作结果描述或错误提示信息\n"
+    ),
+    version="v1.0.0",
+    openapi_tags=tags_metadata,
 )
 
 # 添加串行化中间件，确保请求按顺序处理（避免COM对象多线程访问问题）
 app.add_middleware(SerializationMiddleware)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """全局异常处理器：将 HTTPException 统一转换为标准响应格式"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"code": 50000, "message": exc.detail}
+    )
 
 # 配置：是否在启动时自动启动WPS/PowerPoint
 AUTO_START_APP = True  # 设置为 False 可禁用自动启动
@@ -125,6 +179,10 @@ _com_lock = threading.RLock()
 
 # 全局信号量，确保同一时间只有一个请求在处理
 _request_semaphore = threading.Semaphore(1)
+
+# 自动翻页控制
+_auto_play_stop = threading.Event()   # 停止信号（set=停止）
+_auto_play_running = False            # 是否正在运行自动翻页
 
 
 # ==========================================================
@@ -476,7 +534,9 @@ def get_media_shapes(slide):
 # ==========================================================
 # FastAPI 路由定义
 # ==========================================================
-@app.post("/api/ppt/start_app", response_model=ResponseModel)
+@app.post("/api/ppt/start_app", response_model=ResponseModel, tags=["应用管理"],
+          summary="启动或重启应用",
+          description="手动启动或重启 WPS / PowerPoint 应用。优先启动 prefer 指定的应用，若失败则自动回退到另一个。如果应用已在运行中，则直接返回成功。")
 def start_app(request: StartAppRequest = Body(default=StartAppRequest())):
     """
     手动启动或重启 WPS / PowerPoint 应用。
@@ -508,9 +568,8 @@ def start_app(request: StartAppRequest = Body(default=StartAppRequest())):
         if ppt_app and is_com_alive(ppt_app):
             app_name = "WPS" if use_wps else "PowerPoint"
             return ResponseModel(
-                status="success",
-                message=f"{app_name} 已在运行中",
-                data={"use_wps": use_wps}
+                code=20000,
+                message=f"{app_name} 已在运行中"
             )
 
         # 启动新实例
@@ -532,29 +591,18 @@ def start_app(request: StartAppRequest = Body(default=StartAppRequest())):
                 app_name = "PowerPoint"
 
         return ResponseModel(
-            status="success",
-            message=f"{app_name} 已启动",
-            data={"use_wps": use_wps}
+            code=20000,
+            message=f"{app_name} 已启动"
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/ppt/app_info", response_model=ResponseModel)
+@app.get("/api/ppt/app_info", response_model=ResponseModel, tags=["应用管理"],
+         summary="获取应用信息",
+         description="获取当前运行的 WPS / PowerPoint 应用信息，包括应用名称、版本号、运行状态等。")
 def app_info():
-    """
-    获取当前运行的应用信息
-
-    功能说明:
-        返回当前 WPS 或 PowerPoint 应用的详细信息
-
-    返回:
-        ResponseModel: 包含应用信息的响应对象
-            - running: 应用是否正在运行
-            - app: 应用名称 ("WPS" 或 "PowerPoint")
-            - version: 应用版本号
-            - use_wps: 是否使用 WPS
-    """
+    """获取当前运行的应用信息"""
     global ppt_app, use_wps
 
     # 确保COM环境已初始化
@@ -563,8 +611,8 @@ def app_info():
     try:
         if not ppt_app:
             return ResponseModel(
-                status="success",
-                data={"running": False, "app": None, "version": None}
+                code=20000,
+                message="当前无应用运行"
             )
 
         app_name = "WPS" if use_wps else "PowerPoint"
@@ -577,14 +625,10 @@ def app_info():
         except Exception as e:
             print(f"[WARN] 获取版本信息失败: {e}")
 
+        running = process_alive and is_com_alive(ppt_app)
         return ResponseModel(
-            status="success",
-            data={
-                "running": process_alive and is_com_alive(ppt_app),
-                "app": app_name,
-                "version": version,
-                "use_wps": use_wps
-            }
+            code=20000,
+            message=f"{app_name} 运行中, 版本: {version}" if running else f"{app_name} 未运行"
         )
     except Exception as e:
         # 如果是COM未初始化错误，返回友好的错误信息
@@ -597,24 +641,11 @@ def app_info():
         raise HTTPException(status_code=500, detail=error_msg)
 
 
-@app.get("/api/status", response_model=ResponseModel)
+@app.get("/api/status", response_model=ResponseModel, tags=["应用管理"],
+         summary="获取系统状态",
+         description="获取系统整体运行状态，包括应用是否就绪、演示文稿是否已打开、放映是否正在运行等信息。")
 def status():
-    """
-    获取系统运行状态
-
-    功能说明:
-        返回系统整体运行状态，包括应用、演示文稿、放映等信息
-
-    返回:
-        ResponseModel: 包含系统状态的响应对象
-            - use_wps: 是否使用 WPS
-            - app_ready: 应用对象是否就绪
-            - wps_process_alive: WPS 进程是否存活
-            - ppt_process_alive: PowerPoint 进程是否存活
-            - presentation_open: 演示文稿是否已打开
-            - slideshow_running: 放映是否正在运行
-            - current_ppt: 当前打开的 PPT 文件路径
-    """
+    """获取系统运行状态"""
     # 确保COM环境已初始化
     init_com()
 
@@ -632,42 +663,25 @@ def status():
     except Exception as e:
         print(f"[WARN] 检查放映状态失败: {e}")
 
+    app_name = "WPS" if use_wps else "PowerPoint"
+    parts = []
+    parts.append(f"应用: {app_name}" if ppt_app else "应用: 未启动")
+    parts.append(f"演示文稿: {'已打开' if presentation_open else '未打开'}")
+    parts.append(f"放映: {'进行中' if slideshow_running else '未开始'}")
+    if current_ppt_path:
+        parts.append(f"文件: {Path(current_ppt_path).name}")
+
     return ResponseModel(
-        status="success",
-        data={
-            "use_wps": use_wps,
-            "app_ready": ppt_app is not None,
-            "wps_process_alive": is_process_running(["wpp.exe", "wps"]),
-            "ppt_process_alive": is_process_running(["POWERPNT.EXE", "powerpoint"]),
-            "presentation_open": presentation_open,
-            "slideshow_running": slideshow_running,
-            "current_ppt": current_ppt_path
-        }
+        code=20000,
+        message=", ".join(parts)
     )
 
 
-@app.post("/api/ppt/open", response_model=ResponseModel)
+@app.post("/api/ppt/open", response_model=ResponseModel, tags=["文件操作"],
+          summary="打开PPT文件",
+          description="打开指定路径的 PPT 文件。如果当前已有打开的演示文稿，会先关闭再打开新文件。需要提供文件的完整路径。")
 def open_ppt(request: OpenPPTRequest):
-    """
-    打开指定 PPT 文件
-
-    参数:
-        request.file_path: PPT 文件的完整路径
-
-    功能说明:
-        1. 验证文件路径是否有效
-        2. 确保应用已启动
-        3. 关闭当前打开的演示文稿（如果有）
-        4. 打开新的 PPT 文件
-
-    返回:
-        ResponseModel: 包含打开结果的响应对象
-            - slides: 幻灯片总数
-            - use_wps: 使用的应用类型
-
-    异常:
-        HTTPException: 当文件路径无效或打开失败时抛出错误
-    """
+    """打开指定 PPT 文件"""
     global presentation, current_ppt_path
     ppt_path = request.file_path
 
@@ -703,33 +717,19 @@ def open_ppt(request: OpenPPTRequest):
             print(f"[INFO] 演示文稿加载完成，已就绪（等待 {wait_time:.2f}s）")
 
             return ResponseModel(
-                status="success",
-                message=f"成功打开 {Path(ppt_path).name}",
-                data={"slides": slides_count, "use_wps": use_wps}
+                code=20000,
+                message=f"成功打开 {Path(ppt_path).name}, 共 {slides_count} 张幻灯片"
             )
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/ppt/start", response_model=ResponseModel)
+@app.post("/api/ppt/start", response_model=ResponseModel, tags=["放映控制"],
+          summary="启动幻灯片放映",
+          description="启动幻灯片放映模式，从第一张幻灯片开始播放。必须先通过 /api/ppt/open 打开 PPT 文件。内置重试机制处理 COM 对象忙碌的情况。")
 def start_show():
-    """
-    启动幻灯片放映
-
-    前置条件:
-        必须先打开 PPT 文件
-
-    功能说明:
-        启动幻灯片放映模式，从第一张幻灯片开始播放
-
-    返回:
-        ResponseModel: 包含放映信息的响应对象
-            - current_slide: 当前幻灯片编号
-
-    异常:
-        HTTPException: 当未打开 PPT 或启动失败时抛出错误
-    """
+    """启动幻灯片放映"""
     global slide_show
 
     # 确保COM环境已初始化
@@ -783,20 +783,17 @@ def start_show():
                 raise HTTPException(status_code=500, detail="启动放映失败，请重试")
 
             return ResponseModel(
-                status="success",
-                message="幻灯片放映已启动",
-                data={
-                    "current_slide": current_slide,
-                    "total_slides": slides_count,
-                    "ppt_name": ppt_name
-                }
+                code=20000,
+                message=f"幻灯片放映已启动, 当前第 {current_slide} 张, 共 {slides_count} 张"
             )
         except Exception as e:
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"启动放映失败: {str(e)}")
 
 
-@app.get("/api/ppt/is_ready", response_model=ResponseModel)
+@app.get("/api/ppt/is_ready", response_model=ResponseModel, tags=["放映控制"],
+         summary="检查放映状态",
+         description="检查是否已进入放映模式。依次检测应用是否运行、PPT 是否打开、放映是否已启动，任一条件不满足则返回失败。")
 def is_ready():
     """检查是否已进入放映模式"""
     # 确保COM环境已初始化
@@ -815,15 +812,10 @@ def is_ready():
             slide_num = view.CurrentShowPosition
             total_slides = presentation.Slides.Count
 
+            app_name = "WPS" if use_wps else "PowerPoint"
             return ResponseModel(
-                status="success",
-                data={
-                    "ready": True,
-                    "app": "WPS" if use_wps else "PowerPoint",
-                    "current_slide": slide_num,
-                    "total_slides": total_slides,
-                    "message": "放映模式已启动"
-                }
+                code=20000,
+                message=f"放映模式已启动 ({app_name}), 当前第 {slide_num} 张, 共 {total_slides} 张"
             )
     except HTTPException:
         raise
@@ -831,74 +823,41 @@ def is_ready():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/ppt/next", response_model=ResponseModel)
+@app.post("/api/ppt/next", response_model=ResponseModel, tags=["放映控制"],
+          summary="下一张幻灯片",
+          description="在放映模式下切换到下一张幻灯片。必须先启动放映模式。")
 def next_slide():
-    """
-    切换到下一张幻灯片
-
-    前置条件:
-        必须处于放映模式
-
-    功能说明:
-        在放映模式下切换到下一张幻灯片
-
-    返回:
-        ResponseModel: 包含当前幻灯片编号的响应对象
-    """
+    """切换到下一张幻灯片"""
     if not ensure_slideshow():
         raise HTTPException(status_code=400, detail="放映未启动")
     try:
         slide_show.View.Next()
         pos = slide_show.View.CurrentShowPosition
-        return ResponseModel(status="success", message=f"切换到第 {pos} 张")
+        return ResponseModel(code=20000, message=f"切换到第 {pos} 张")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/ppt/prev", response_model=ResponseModel)
+@app.post("/api/ppt/prev", response_model=ResponseModel, tags=["放映控制"],
+          summary="上一张幻灯片",
+          description="在放映模式下切换到上一张幻灯片。必须先启动放映模式。")
 def prev_slide():
-    """
-    切换到上一张幻灯片
-
-    前置条件:
-        必须处于放映模式
-
-    功能说明:
-        在放映模式下切换到上一张幻灯片
-
-    返回:
-        ResponseModel: 包含当前幻灯片编号的响应对象
-    """
+    """切换到上一张幻灯片"""
     if not ensure_slideshow():
         raise HTTPException(status_code=400, detail="放映未启动")
     try:
         slide_show.View.Previous()
         pos = slide_show.View.CurrentShowPosition
-        return ResponseModel(status="success", message=f"返回到第 {pos} 张")
+        return ResponseModel(code=20000, message=f"返回到第 {pos} 张")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/ppt/goto", response_model=ResponseModel)
+@app.post("/api/ppt/goto", response_model=ResponseModel, tags=["放映控制"],
+          summary="跳转到指定幻灯片",
+          description="在放映模式下直接跳转到指定编号的幻灯片。幻灯片编号从 1 开始，不能超出总页数范围。")
 def goto_slide(request: GotoSlideRequest):
-    """
-    跳转到指定幻灯片
-
-    参数:
-        request.slide: 目标幻灯片编号（从 1 开始）
-
-    前置条件:
-        必须处于放映模式
-
-    功能说明:
-        在放映模式下直接跳转到指定编号的幻灯片
-
-    返回:
-        ResponseModel: 包含跳转结果的响应对象
-
-    异常:
-        HTTPException: 当幻灯片编号超出范围时抛出 400 错误
-    """
+    """跳转到指定幻灯片"""
     if not ensure_slideshow():
         raise HTTPException(status_code=400, detail="放映未启动")
     try:
@@ -911,7 +870,7 @@ def goto_slide(request: GotoSlideRequest):
             )
         slide_show.View.GotoSlide(slide_num)
         return ResponseModel(
-            status="success",
+            code=20000,
             message=f"已跳转到第 {slide_num} 张幻灯片"
         )
     except HTTPException:
@@ -920,49 +879,27 @@ def goto_slide(request: GotoSlideRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/ppt/exit_show", response_model=ResponseModel)
+@app.post("/api/ppt/exit_show", response_model=ResponseModel, tags=["放映控制"],
+          summary="退出放映模式",
+          description="退出当前的幻灯片放映模式，返回编辑视图。不会关闭演示文稿或应用程序。如果当前未在放映模式，也会返回成功。")
 def exit_show():
-    """
-    退出放映模式
-
-    功能说明:
-        退出当前的幻灯片放映模式，返回编辑视图
-        不会关闭演示文稿或应用程序
-
-    返回:
-        ResponseModel: 包含执行结果的响应对象
-
-    说明:
-        如果当前未在放映模式，也会返回成功
-    """
+    """退出放映模式"""
     global slide_show
     if not ensure_slideshow():
-        return ResponseModel(status="success", message="当前未在放映模式")
+        return ResponseModel(code=20000, message="当前未在放映模式")
     try:
         slide_show.View.Exit()
         slide_show = None
-        return ResponseModel(status="success", message="已退出放映模式")
+        return ResponseModel(code=20000, message="已退出放映模式")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/ppt/exit_app", response_model=ResponseModel)
+@app.post("/api/ppt/exit_app", response_model=ResponseModel, tags=["应用管理"],
+          summary="优雅关闭应用",
+          description="通过 COM 接口优雅关闭 WPS / PowerPoint 应用。依次退出放映模式、关闭演示文稿、退出应用程序并清理所有全局对象引用。")
 def exit_app():
-    """
-    优雅关闭 WPS / PowerPoint 应用（通过 COM）
-
-    功能说明:
-        1. 退出放映模式（如果正在放映）
-        2. 关闭当前演示文稿（如果已打开）
-        3. 退出应用程序
-        4. 清理所有全局对象引用
-
-    返回:
-        ResponseModel: 包含执行结果的响应对象
-
-    异常:
-        HTTPException: 当操作失败时抛出 500 错误
-    """
+    """优雅关闭 WPS / PowerPoint 应用"""
     global ppt_app, presentation, slide_show
     try:
         if slide_show:
@@ -974,30 +911,16 @@ def exit_app():
         if ppt_app:
             ppt_app.Quit()
             ppt_app = None
-        return ResponseModel(status="success", message="WPS / PowerPoint 已优雅退出")
+        return ResponseModel(code=20000, message="WPS / PowerPoint 已优雅退出")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/ppt/force_close", response_model=ResponseModel)
+@app.post("/api/ppt/force_close", response_model=ResponseModel, tags=["应用管理"],
+          summary="强制关闭应用",
+          description="强制终止 WPS / PowerPoint 相关进程，不进行优雅退出。适用于应用无响应或 COM 调用失败的情况。**警告：可能导致未保存的数据丢失，建议优先使用优雅关闭接口。**")
 def force_close_app():
-    """
-    强制关闭 WPS / PowerPoint 应用进程
-
-    功能说明:
-        直接终止 WPS/PowerPoint 相关进程，不进行优雅退出
-        适用于应用无响应或 COM 调用失败的情况
-
-    警告:
-        此方法会强制结束进程，可能导致未保存的数据丢失
-        建议优先使用 /api/ppt/exit_app 进行优雅关闭
-
-    返回:
-        ResponseModel: 包含执行结果和被关闭的进程列表
-
-    异常:
-        HTTPException: 当操作失败时抛出 500 错误
-    """
+    """强制关闭 WPS / PowerPoint 应用进程"""
     global ppt_app, presentation, slide_show
 
     try:
@@ -1047,13 +970,12 @@ def force_close_app():
             message = f"已强制关闭 {', '.join(summary)} 进程"
 
             return ResponseModel(
-                status="success",
-                message=message,
-                data={"killed_processes": killed_processes, "total": len(killed_processes)}
+                code=20000,
+                message=message
             )
         else:
             return ResponseModel(
-                status="success",
+                code=20000,
                 message="未找到运行中的 WPS / PowerPoint 进程"
             )
 
@@ -1061,73 +983,131 @@ def force_close_app():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/media/info", response_model=ResponseModel)
+@app.get("/api/media/info", response_model=ResponseModel, tags=["媒体信息"],
+         summary="获取媒体信息",
+         description="获取当前放映幻灯片中的所有媒体对象（视频/音频）信息。必须处于放映模式。")
 def media_info():
-    """
-    获取当前幻灯片中的媒体信息
-
-    功能说明:
-        返回当前幻灯片中的所有媒体对象（视频/音频）信息
-
-    前置条件:
-        必须处于放映模式
-
-    返回:
-        ResponseModel: 包含媒体信息的响应对象
-            - slide_number: 当前幻灯片编号
-            - media_count: 媒体对象数量
-            - media: 媒体对象列表 [{name, type}, ...]
-
-    异常:
-        HTTPException: 当未进入放映模式时抛出 400 错误
-    """
+    """获取当前幻灯片中的媒体信息"""
     if not ensure_slideshow():
         raise HTTPException(status_code=400, detail="放映未启动")
     try:
         slide = slide_show.View.Slide
         media = get_media_shapes(slide)
+        slide_num = slide_show.View.CurrentShowPosition
+        if media:
+            media_desc = ", ".join([f"{m['name']}({m['type']})" for m in media])
+            return ResponseModel(
+                code=20000,
+                message=f"第 {slide_num} 张幻灯片包含 {len(media)} 个媒体: {media_desc}"
+            )
+        else:
+            return ResponseModel(
+                code=20000,
+                message=f"第 {slide_num} 张幻灯片无媒体对象"
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/ppt/current", response_model=ResponseModel, tags=["放映控制"],
+         summary="获取当前幻灯片位置",
+         description="获取当前放映中的幻灯片编号和总页数。必须处于放映模式。")
+def current_slide():
+    """获取当前幻灯片位置"""
+    if not ensure_slideshow():
+        raise HTTPException(status_code=400, detail="放映未启动")
+    try:
+        pos = slide_show.View.CurrentShowPosition
+        total = presentation.Slides.Count
         return ResponseModel(
-            status="success",
-            data={
-                "slide_number": slide_show.View.CurrentShowPosition,
-                "media_count": len(media),
-                "media": media
-            }
+            code=20000,
+            message=f"当前第 {pos} 张, 共 {total} 张"
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/ppt/auto_play", response_model=ResponseModel)
+@app.post("/api/ppt/blank", response_model=ResponseModel, tags=["放映控制"],
+          summary="黑屏/白屏/恢复",
+          description="在放映模式下切换黑屏、白屏或恢复正常显示。action 可选值：`black`（黑屏）、`white`（白屏）、`resume`（恢复正常）。")
+def blank_screen(request: BlankRequest = Body(default=BlankRequest())):
+    """黑屏/白屏/恢复"""
+    if not ensure_slideshow():
+        raise HTTPException(status_code=400, detail="放映未启动")
+    try:
+        action = request.action.lower()
+        # ppSlideShowRunning=1, ppSlideShowBlackScreen=3, ppSlideShowWhiteScreen=4
+        action_map = {
+            "black": (3, "已切换为黑屏"),
+            "white": (4, "已切换为白屏"),
+            "resume": (1, "已恢复正常显示"),
+        }
+        if action not in action_map:
+            raise HTTPException(status_code=400, detail=f"无效的 action: {action}, 可选值: black, white, resume")
+
+        state_value, msg = action_map[action]
+        slide_show.View.State = state_value
+        return ResponseModel(code=20000, message=msg)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/ppt/close", response_model=ResponseModel, tags=["文件操作"],
+          summary="关闭演示文稿",
+          description="关闭当前打开的演示文稿，但不关闭 WPS / PowerPoint 应用。如果正在放映会先退出放映模式。")
+def close_presentation():
+    """关闭演示文稿（不关闭应用）"""
+    global presentation, slide_show, current_ppt_path
+    try:
+        if slide_show:
+            try:
+                slide_show.View.Exit()
+            except Exception:
+                pass
+            slide_show = None
+
+        if not ensure_presentation():
+            return ResponseModel(code=20000, message="当前无打开的演示文稿")
+
+        file_name = Path(current_ppt_path).name if current_ppt_path else "未知文件"
+        presentation.Close()
+        presentation = None
+        current_ppt_path = None
+        return ResponseModel(code=20000, message=f"已关闭 {file_name}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/ppt/stop_auto_play", response_model=ResponseModel, tags=["放映控制"],
+          summary="停止自动翻页",
+          description="停止正在运行的自动翻页任务。此接口不受串行化中间件限制，可在自动翻页运行期间随时调用。")
+def stop_auto_play():
+    """停止自动翻页"""
+    if not _auto_play_running:
+        return ResponseModel(code=20000, message="当前没有正在运行的自动翻页任务")
+    _auto_play_stop.set()
+    return ResponseModel(code=20000, message="已发送停止信号，自动翻页将在当前动作完成后停止")
+
+
+@app.post("/api/ppt/auto_play", response_model=ResponseModel, tags=["放映控制"],
+          summary="自动翻页",
+          description=(
+              "根据时间线自动翻页（节奏驱动版）。每个时间点独立执行，不计算累计时间差，保证后续节点不会被前一组的耗时影响。\n\n"
+              "**timeline 格式：** `[[时间点, 翻页次数, 翻页间隔秒], ...]`\n\n"
+              "**示例：** `[[38.0, 2, 1.5], [50.0, 3, 1.2]]` 表示在第 38 秒点击 2 次（间隔 1.5s），在第 50 秒点击 3 次（间隔 1.2s）。"
+          ))
 def auto_play(request: AutoPlayRequest):
-    """
-    自动翻页（节奏驱动版，无动画检测、无时间累积误差）
-
-    参数:
-        request.timeline: 时间线数组，格式如下:
-            [[时间点, 翻页次数, 翻页间隔秒], ...]
-            示例: [[38.0, 2, 1.5], [50.0, 3, 1.2]]
-        request.lead_time: 提前时间（秒），默认 0.0
-        request.auto_exit: 是否自动退出放映模式，默认 False
-
-    前置条件:
-        必须处于放映模式
-
-    功能说明:
-        根据时间线自动翻页，每个时间点独立执行
-        每组时间点内点击多次，每次之间固定间隔
-        不计算累计时间差，保证后续节点不会被前一组的耗时影响
-
-    返回:
-        ResponseModel: 包含执行结果和统计信息的响应对象
-
-    异常:
-        HTTPException: 当未进入放映模式或参数错误时抛出错误
-    """
+    """自动翻页（节奏驱动版）"""
+    global _auto_play_running
     try:
         # 1. 确认放映模式
         if not ensure_slideshow():
             raise HTTPException(status_code=400, detail="请先进入放映模式")
+
+        if _auto_play_running:
+            raise HTTPException(status_code=400, detail="自动翻页任务正在运行中，请先停止当前任务")
 
         # 2. 解析参数
         timeline = request.timeline
@@ -1140,11 +1120,22 @@ def auto_play(request: AutoPlayRequest):
                 detail="timeline 参数缺失或格式错误，应为二维数组"
             )
 
+        # 3. 初始化停止信号
+        _auto_play_stop.clear()
+        _auto_play_running = True
+
         print(f"[AUTO] 自动翻页启动，共 {len(timeline)} 个时间点")
         base_time = time.time()  # 程序启动时间（仅用于初始同步）
+        stopped = False
 
-        # 3. 遍历每个时间节点
+        # 4. 遍历每个时间节点
         for i, item in enumerate(timeline, start=1):
+            # 检查停止信号
+            if _auto_play_stop.is_set():
+                stopped = True
+                print("[AUTO] 收到停止信号，终止自动翻页")
+                break
+
             if not isinstance(item, (list, tuple)) or len(item) < 1:
                 print(f"[AUTO] 第 {i} 项格式错误，跳过: {item}")
                 continue
@@ -1155,14 +1146,23 @@ def auto_play(request: AutoPlayRequest):
 
             print(f"[AUTO] 等待 {target_time:.2f}s 到达执行点 (点击 {flip_count} 次, 间隔 {flip_interval}s)")
 
-            # 独立等待到达节点时间（相对程序启动）
+            # 独立等待到达节点时间（相对程序启动），期间检查停止信号
             while time.time() - base_time < (target_time - lead_time):
-                time.sleep(0.05)
+                if _auto_play_stop.wait(0.05):
+                    stopped = True
+                    break
+            if stopped:
+                print("[AUTO] 收到停止信号，终止自动翻页")
+                break
 
             print(f"[AUTO] 到达 {target_time:.2f}s，开始第 {i} 组点击动作")
 
             # 执行多次点击
             for j in range(flip_count):
+                # 检查停止信号
+                if _auto_play_stop.is_set():
+                    stopped = True
+                    break
                 try:
                     if not slide_show:
                         raise HTTPException(status_code=400, detail="放映窗口已关闭")
@@ -1172,40 +1172,52 @@ def auto_play(request: AutoPlayRequest):
 
                     # 除最后一次外，每次都固定等待 flip_interval 秒
                     if j < flip_count - 1:
-                        time.sleep(flip_interval)
+                        if _auto_play_stop.wait(flip_interval):
+                            stopped = True
+                            break
 
                 except HTTPException:
                     raise
                 except Exception as e:
                     print(f"    [ERROR] 点击失败: {e}")
-                    # 出错也等一段时间再继续
-                    time.sleep(flip_interval)
+                    if _auto_play_stop.wait(flip_interval):
+                        stopped = True
+                        break
 
-        # 4. 自动退出放映
-        if auto_exit and slide_show:
+            if stopped:
+                print("[AUTO] 收到停止信号，终止自动翻页")
+                break
+
+        # 5. 自动退出放映（仅在正常完成时）
+        if not stopped and auto_exit and slide_show:
             print("[AUTO] 所有动作完成，退出放映模式")
             try:
                 slide_show.View.Exit()
             except Exception as e:
                 print(f"[WARN] 自动退出失败: {e}")
 
+        _auto_play_running = False
+
+        if stopped:
+            print("[AUTO] 自动翻页已被手动停止")
+            return ResponseModel(
+                code=20000,
+                message=f"自动翻页已停止, 已执行 {i - 1}/{len(timeline)} 个时间点"
+            )
+
         print("[AUTO] 自动翻页任务完成")
 
-        # 5. 返回执行结果
+        # 6. 返回执行结果
         return ResponseModel(
-            status="success",
-            message="自动翻页任务执行完毕（节奏驱动版）",
-            data={
-                "timeline": timeline,
-                "lead_time": lead_time,
-                "auto_exit": auto_exit,
-                "total_points": len(timeline)
-            }
+            code=20000,
+            message=f"自动翻页任务执行完毕, 共 {len(timeline)} 个时间点"
         )
 
     except HTTPException:
+        _auto_play_running = False
         raise
     except Exception as e:
+        _auto_play_running = False
         print(f"[AUTO] 异常: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1216,49 +1228,58 @@ def auto_play(request: AutoPlayRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    print("=== WPS / PowerPoint 控制服务器 (FastAPI) ===")
-    if AUTO_START_APP:
-        print("[提示] 服务启动后将自动启动 WPS/PowerPoint（可通过修改 AUTO_START_APP 禁用）")
-    else:
-        print("[提示] 自动启动已禁用，WPS/PowerPoint 将在第一次API调用时启动")
+    try:
+        print("=== WPS / PowerPoint 控制服务器 (FastAPI) ===")
+        if AUTO_START_APP:
+            print("[提示] 服务启动后将自动启动 WPS/PowerPoint（可通过修改 AUTO_START_APP 禁用）")
+        else:
+            print("[提示] 自动启动已禁用，WPS/PowerPoint 将在第一次API调用时启动")
 
-    print("\n接口列表：")
-    print("=" * 100)
-    print("【应用管理】")
-    print("  - POST /api/ppt/start_app      # 手动启动或重启 WPS 或 PowerPoint 应用（参数: prefer='wps'/'ppt'）")
-    print("  - GET  /api/ppt/app_info       # 获取当前运行软件信息（版本、进程、COM 状态等）")
-    print("  - GET  /api/status             # 获取当前系统整体状态（应用、演示文稿、放映等）")
-    print("  - POST /api/ppt/exit_app       # 优雅关闭 WPS / PowerPoint 应用（通过 COM）")
-    print("  - POST /api/ppt/force_close    # 强制关闭 WPS / PowerPoint 应用进程（适用于无响应情况）")
-    print()
-    print("【文件操作】")
-    print("  - POST /api/ppt/open           # 打开指定 PPT 文件（参数: file_path）")
-    print()
-    print("【放映控制】")
-    print("  - POST /api/ppt/start          # 启动幻灯片放映")
-    print("  - GET  /api/ppt/is_ready       # 检查是否已进入放映模式")
-    print("  - POST /api/ppt/next           # 切换到下一张幻灯片")
-    print("  - POST /api/ppt/prev           # 切换到上一张幻灯片")
-    print("  - POST /api/ppt/goto           # 跳转到指定幻灯片（参数: slide）")
-    print("  - POST /api/ppt/auto_play      # 根据时间线自动翻页（参数: timeline, lead_time, auto_exit）")
-    print("  - POST /api/ppt/exit_show      # 退出放映模式")
-    print()
-    print("【媒体信息】")
-    print("  - GET  /api/media/info         # 获取当前幻灯片中的媒体信息（视频/音频）")
-    print("=" * 100)
-    print("\n服务器已启动：http://127.0.0.1:8000")
-    print("API 文档：http://127.0.0.1:8000/docs")
-    print("ReDoc 文档：http://127.0.0.1:8000/redoc")
+        print("\n接口列表：")
+        print("=" * 100)
+        print("【应用管理】")
+        print("  - POST /api/ppt/start_app      # 手动启动或重启 WPS 或 PowerPoint 应用（参数: prefer='wps'/'ppt'）")
+        print("  - GET  /api/ppt/app_info       # 获取当前运行软件信息（版本、进程、COM 状态等）")
+        print("  - GET  /api/status             # 获取当前系统整体状态（应用、演示文稿、放映等）")
+        print("  - POST /api/ppt/exit_app       # 优雅关闭 WPS / PowerPoint 应用（通过 COM）")
+        print("  - POST /api/ppt/force_close    # 强制关闭 WPS / PowerPoint 应用进程（适用于无响应情况）")
+        print()
+        print("【文件操作】")
+        print("  - POST /api/ppt/open           # 打开指定 PPT 文件（参数: file_path）")
+        print("  - POST /api/ppt/close          # 关闭演示文稿（不关闭应用）")
+        print()
+        print("【放映控制】")
+        print("  - POST /api/ppt/start          # 启动幻灯片放映")
+        print("  - GET  /api/ppt/is_ready       # 检查是否已进入放映模式")
+        print("  - GET  /api/ppt/current        # 获取当前幻灯片位置")
+        print("  - POST /api/ppt/next           # 切换到下一张幻灯片")
+        print("  - POST /api/ppt/prev           # 切换到上一张幻灯片")
+        print("  - POST /api/ppt/goto           # 跳转到指定幻灯片（参数: slide）")
+        print("  - POST /api/ppt/blank          # 黑屏/白屏/恢复（参数: action='black'/'white'/'resume'）")
+        print("  - POST /api/ppt/auto_play      # 根据时间线自动翻页（参数: timeline, lead_time, auto_exit）")
+        print("  - POST /api/ppt/stop_auto_play # 停止自动翻页")
+        print("  - POST /api/ppt/exit_show      # 退出放映模式")
+        print()
+        print("【媒体信息】")
+        print("  - GET  /api/media/info         # 获取当前幻灯片中的媒体信息（视频/音频）")
+        print("=" * 100)
+        print("\n服务器已启动：http://127.0.0.1:8000")
+        print("API 文档：http://127.0.0.1:8000/docs")
+        print("ReDoc 文档：http://127.0.0.1:8000/redoc")
 
-    # 启动 Uvicorn 服务
-    # 重要：
-    # 1. 使用串行化中间件确保请求按顺序处理
-    # 2. 使用workers=1确保单进程运行
-    # 3. 重试机制处理COM对象忙碌的情况
-    print("\n注意：已启用串行化中间件和重试机制，确保COM对象访问的线程安全")
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        workers=1  # 单工作进程
-    )
+        # 启动 Uvicorn 服务
+        # 重要：
+        # 1. 使用串行化中间件确保请求按顺序处理
+        # 2. 使用workers=1确保单进程运行
+        # 3. 重试机制处理COM对象忙碌的情况
+        print("\n注意：已启用串行化中间件和重试机制，确保COM对象访问的线程安全")
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=8000,
+            workers=1  # 单工作进程
+        )
+    except Exception as e:
+        print(f"\n[ERROR] 启动失败: {e}")
+        traceback.print_exc()
+        input("\n按回车键退出...")
