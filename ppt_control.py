@@ -27,9 +27,6 @@ WPS / PowerPoint 幻灯片控制 API 服务 (FastAPI)
     - POST /api/ppt/exit_app        优雅关闭 WPS / PowerPoint 应用（通过COM）
     - POST /api/ppt/force_close     强制关闭 WPS / PowerPoint 应用进程
     - GET  /api/media/info          获取当前幻灯片中的媒体信息（视频/音频）
-
-依赖安装：
-    pip install fastapi uvicorn comtypes pywin32 psutil pydantic requests
 """
 
 import comtypes.client as com
