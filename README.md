@@ -84,7 +84,8 @@ python ppt_control.py
 | POST | `/api/ppt/prev_slide` | 上一页（跳过动画直接翻页） |
 | POST | `/api/ppt/goto` | 跳转到指定幻灯片 |
 | POST | `/api/ppt/blank` | 黑屏/白屏/恢复 |
-| POST | `/api/ppt/auto_play` | 根据时间线自动翻页 |
+| POST | `/api/ppt/auto_play` | 根据时间线自动翻页（同步阻塞） |
+| POST | `/api/ppt/auto_play_async` | 异步自动翻页（立即返回，后台执行） |
 | POST | `/api/ppt/stop_auto_play` | 停止自动翻页 |
 | POST | `/api/ppt/exit_show` | 退出放映模式 |
 
@@ -168,11 +169,28 @@ python ppt_control.py
 | `lead_time` | float | `0.0` | 提前触发时间（秒） |
 | `auto_exit` | bool | `false` | 播放完成后是否自动退出放映 |
 
-**timeline 示例说明：**
+**timeline 格式：** `[时间点, 翻页次数, 翻页间隔秒]`
+
+| 位置 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `[0]` | float | 是 | - | 触发时间点（秒，相对于开始时刻） |
+| `[1]` | int | 否 | `1` | 翻页次数 |
+| `[2]` | float | 否 | `0.0` | 多次翻页时的间隔秒数（翻页次数为 1 时无效） |
+
+**示例：**
 
 `[[38.0, 2, 1.5], [50.0, 3, 1.2]]` 表示：
 - 第 38 秒：点击 2 次，每次间隔 1.5 秒
 - 第 50 秒：点击 3 次，每次间隔 1.2 秒
+
+`[[5.0, 1], [10.0, 1]]` 表示：
+- 第 5 秒和第 10 秒各点击 1 次（无需指定间隔）
+
+### POST /api/ppt/auto_play_async
+
+异步版自动翻页，调用后立即返回，翻页在后台线程执行。参数与 `/api/ppt/auto_play` 完全一致。
+
+可通过 `/api/ppt/stop_auto_play` 停止后台翻页任务。
 
 ### POST /api/ppt/stop_auto_play
 
@@ -234,6 +252,6 @@ ppt_control/
 ## 技术说明
 
 - **COM 自动化：** 通过 `comtypes` 库操作 WPS (`Kwpp.Application`) 或 PowerPoint (`PowerPoint.Application`)
-- **线程安全：** 串行化中间件 + RLock + 线程本地 COM 初始化，确保 COM 对象不被多线程并发访问
+- **线程安全：** 串行化中间件 + RLock + 线程本地 COM 初始化，确保 COM 对象不被多线程并发访问；异步翻页线程通过 `GetActiveObject` 重新获取 COM 引用，避免跨线程访问 STA 对象
 - **容错机制：** COM 对象有效性检测、"被呼叫方拒绝"错误自动重试、进程存活双重检测
 - **应用优先级：** 默认优先使用 WPS，失败自动回退到 PowerPoint
