@@ -24,6 +24,7 @@ WPS / PowerPoint 幻灯片控制 API 服务 (FastAPI)
     - POST /api/ppt/goto            跳转到指定幻灯片
     - POST /api/ppt/blank           黑屏/白屏/恢复
     - POST /api/ppt/auto_play       根据时间线自动翻页（参数: timeline, lead_time, auto_exit）
+    - POST /api/ppt/auto_play_async  异步自动翻页，立即返回，后台执行（参数同 auto_play）
     - POST /api/ppt/stop_auto_play  停止自动翻页
     - POST /api/ppt/exit_show       退出放映模式
     - POST /api/ppt/exit_app        优雅关闭 WPS / PowerPoint 应用（通过COM）
@@ -59,7 +60,7 @@ class SerializationMiddleware(BaseHTTPMiddleware):
         部分不涉及COM操作的接口（如停止自动翻页）可跳过串行化。
     """
     # 不需要串行化的路径（不涉及COM操作，仅操作内存标志位）
-    SKIP_PATHS = {"/api/ppt/stop_auto_play"}
+    SKIP_PATHS = {"/api/ppt/stop_auto_play", "/api/ppt/auto_play_async"}
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path in self.SKIP_PATHS:
@@ -1134,46 +1135,45 @@ def stop_auto_play():
     return ResponseModel(code=20000, message="已发送停止信号，自动翻页将在当前动作完成后停止")
 
 
-@app.post("/api/ppt/auto_play", response_model=ResponseModel, tags=["放映控制"],
-          summary="自动翻页",
-          description=(
-              "根据时间线自动翻页（节奏驱动版）。每个时间点独立执行，不计算累计时间差，保证后续节点不会被前一组的耗时影响。\n\n"
-              "**timeline 格式：** `[[时间点, 翻页次数, 翻页间隔秒], ...]`\n\n"
-              "**示例：** `[[38.0, 2, 1.5], [50.0, 3, 1.2]]` 表示在第 38 秒点击 2 次（间隔 1.5s），在第 50 秒点击 3 次（间隔 1.2s）。"
-          ))
-def auto_play(request: AutoPlayRequest):
-    """自动翻页（节奏驱动版）"""
+def _auto_play_worker(timeline, lead_time, auto_exit):
+    """
+    自动翻页核心执行逻辑（供同步/异步接口复用）
+
+    Args:
+        timeline: 时间线数组
+        lead_time: 提前时间（秒）
+        auto_exit: 是否自动退出放映
+
+    Returns:
+        tuple: (stopped: bool, executed: int, total: int)
+    """
     global _auto_play_running
+
+    init_com()
+    _auto_play_stop.clear()
+    _auto_play_running = True
+
+    total = len(timeline)
+    executed = 0
+
     try:
-        # 1. 确认放映模式
-        if not ensure_slideshow():
-            raise HTTPException(status_code=400, detail="请先进入放映模式")
+        # 在当前线程重新获取 COM 对象，避免跨线程访问导致的 RPC_E_WRONG_THREAD 错误
+        try:
+            if use_wps:
+                local_app = com.GetActiveObject("Kwpp.Application")
+            else:
+                local_app = com.GetActiveObject("PowerPoint.Application")
+            local_view = local_app.SlideShowWindows.Item(1).View
+            print(f"[AUTO] 已在当前线程获取 COM 引用")
+        except Exception as e:
+            print(f"[AUTO] 无法获取放映窗口 COM 引用: {e}")
+            return True, 0, total
 
-        if _auto_play_running:
-            raise HTTPException(status_code=400, detail="自动翻页任务正在运行中，请先停止当前任务")
-
-        # 2. 解析参数
-        timeline = request.timeline
-        lead_time = request.lead_time
-        auto_exit = request.auto_exit
-
-        if not timeline or not isinstance(timeline, list):
-            raise HTTPException(
-                status_code=400,
-                detail="timeline 参数缺失或格式错误，应为二维数组"
-            )
-
-        # 3. 初始化停止信号
-        _auto_play_stop.clear()
-        _auto_play_running = True
-
-        print(f"[AUTO] 自动翻页启动，共 {len(timeline)} 个时间点")
-        base_time = time.time()  # 程序启动时间（仅用于初始同步）
+        print(f"[AUTO] 自动翻页启动，共 {total} 个时间点")
+        base_time = time.time()
         stopped = False
 
-        # 4. 遍历每个时间节点
         for i, item in enumerate(timeline, start=1):
-            # 检查停止信号
             if _auto_play_stop.is_set():
                 stopped = True
                 print("[AUTO] 收到停止信号，终止自动翻页")
@@ -1183,13 +1183,15 @@ def auto_play(request: AutoPlayRequest):
                 print(f"[AUTO] 第 {i} 项格式错误，跳过: {item}")
                 continue
 
-            target_time = float(item[0])         # 节点触发时间
+            target_time = float(item[0])
             flip_count = int(item[1]) if len(item) > 1 else 1
-            flip_interval = float(item[2]) if len(item) > 2 else 1.0
+            flip_interval = float(item[2]) if len(item) > 2 else 0.0
 
-            print(f"[AUTO] 等待 {target_time:.2f}s 到达执行点 (点击 {flip_count} 次, 间隔 {flip_interval}s)")
+            if flip_count > 1:
+                print(f"[AUTO] 等待 {target_time:.2f}s 到达执行点 (点击 {flip_count} 次, 间隔 {flip_interval}s)")
+            else:
+                print(f"[AUTO] 等待 {target_time:.2f}s 到达执行点 (点击 {flip_count} 次)")
 
-            # 独立等待到达节点时间（相对程序启动），期间检查停止信号
             while time.time() - base_time < (target_time - lead_time):
                 if _auto_play_stop.wait(0.05):
                     stopped = True
@@ -1200,69 +1202,116 @@ def auto_play(request: AutoPlayRequest):
 
             print(f"[AUTO] 到达 {target_time:.2f}s，开始第 {i} 组点击动作")
 
-            # 执行多次点击
             for j in range(flip_count):
-                # 检查停止信号
                 if _auto_play_stop.is_set():
                     stopped = True
                     break
                 try:
-                    if not slide_show:
-                        raise HTTPException(status_code=400, detail="放映窗口已关闭")
-                    print(time.time())
-                    slide_show.View.Next()
+                    local_view.Next()
                     print(f"    [AUTO] 点击 {j+1}/{flip_count}")
 
-                    # 除最后一次外，每次都固定等待 flip_interval 秒
-                    if j < flip_count - 1:
+                    if j < flip_count - 1 and flip_interval > 0:
                         if _auto_play_stop.wait(flip_interval):
                             stopped = True
                             break
 
-                except HTTPException:
-                    raise
                 except Exception as e:
                     print(f"    [ERROR] 点击失败: {e}")
-                    if _auto_play_stop.wait(flip_interval):
-                        stopped = True
-                        break
+                    if flip_interval > 0:
+                        if _auto_play_stop.wait(flip_interval):
+                            stopped = True
+                            break
 
             if stopped:
                 print("[AUTO] 收到停止信号，终止自动翻页")
                 break
 
-        # 5. 自动退出放映（仅在正常完成时）
-        if not stopped and auto_exit and slide_show:
+            executed = i
+
+        if not stopped:
+            executed = total
+
+        if not stopped and auto_exit:
             print("[AUTO] 所有动作完成，退出放映模式")
             try:
-                slide_show.View.Exit()
+                local_view.Exit()
             except Exception as e:
                 print(f"[WARN] 自动退出失败: {e}")
 
-        _auto_play_running = False
-
         if stopped:
             print("[AUTO] 自动翻页已被手动停止")
-            return ResponseModel(
-                code=20000,
-                message=f"自动翻页已停止, 已执行 {i - 1}/{len(timeline)} 个时间点"
-            )
+        else:
+            print("[AUTO] 自动翻页任务完成")
 
-        print("[AUTO] 自动翻页任务完成")
+        return stopped, executed, total
 
-        # 6. 返回执行结果
-        return ResponseModel(
-            code=20000,
-            message=f"自动翻页任务执行完毕, 共 {len(timeline)} 个时间点"
-        )
+    finally:
+        _auto_play_running = False
+
+
+@app.post("/api/ppt/auto_play", response_model=ResponseModel, tags=["放映控制"],
+          summary="自动翻页",
+          description=(
+              "根据时间线自动翻页（节奏驱动版，同步阻塞）。每个时间点独立执行，不计算累计时间差，保证后续节点不会被前一组的耗时影响。\n\n"
+              "**timeline 格式：** `[[时间点, 翻页次数, 翻页间隔秒], ...]`\n\n"
+              "**示例：** `[[38.0, 2, 1.5], [50.0, 3, 1.2]]` 表示在第 38 秒点击 2 次（间隔 1.5s），在第 50 秒点击 3 次（间隔 1.2s）。"
+          ))
+def auto_play(request: AutoPlayRequest):
+    """自动翻页（同步阻塞版）"""
+    try:
+        if not ensure_slideshow():
+            raise HTTPException(status_code=400, detail="请先进入放映模式")
+
+        if _auto_play_running:
+            raise HTTPException(status_code=400, detail="自动翻页任务正在运行中，请先停止当前任务")
+
+        timeline = request.timeline
+        if not timeline or not isinstance(timeline, list):
+            raise HTTPException(status_code=400, detail="timeline 参数缺失或格式错误，应为二维数组")
+
+        stopped, executed, total = _auto_play_worker(timeline, request.lead_time, request.auto_exit)
+
+        if stopped:
+            return ResponseModel(code=20000, message=f"自动翻页已停止, 已执行 {executed}/{total} 个时间点")
+
+        return ResponseModel(code=20000, message=f"自动翻页任务执行完毕, 共 {total} 个时间点")
 
     except HTTPException:
-        _auto_play_running = False
         raise
     except Exception as e:
-        _auto_play_running = False
         print(f"[AUTO] 异常: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/ppt/auto_play_async", response_model=ResponseModel, tags=["放映控制"],
+          summary="异步自动翻页",
+          description=(
+              "异步版自动翻页，调用后立即返回，翻页在后台执行。参数与 /api/ppt/auto_play 完全一致。\n\n"
+              "可通过 /api/ppt/stop_auto_play 停止后台翻页任务。"
+          ))
+def auto_play_async(request: AutoPlayRequest):
+    """异步自动翻页（立即返回，后台执行）"""
+    if not ensure_slideshow():
+        raise HTTPException(status_code=400, detail="请先进入放映模式")
+
+    if _auto_play_running:
+        raise HTTPException(status_code=400, detail="自动翻页任务正在运行中，请先停止当前任务")
+
+    timeline = request.timeline
+    if not timeline or not isinstance(timeline, list):
+        raise HTTPException(status_code=400, detail="timeline 参数缺失或格式错误，应为二维数组")
+
+    thread = threading.Thread(
+        target=_auto_play_worker,
+        args=(timeline, request.lead_time, request.auto_exit),
+        daemon=True
+    )
+    thread.start()
+
+    return ResponseModel(
+        code=20000,
+        message=f"异步自动翻页已启动, 共 {len(timeline)} 个时间点"
+    )
 
 
 # ==========================================================
@@ -1302,6 +1351,7 @@ if __name__ == "__main__":
         print("  - POST /api/ppt/goto           # 跳转到指定幻灯片（参数: slide）")
         print("  - POST /api/ppt/blank          # 黑屏/白屏/恢复（参数: action='black'/'white'/'resume'）")
         print("  - POST /api/ppt/auto_play      # 根据时间线自动翻页（参数: timeline, lead_time, auto_exit）")
+        print("  - POST /api/ppt/auto_play_async # 异步自动翻页，立即返回，后台执行（参数同 auto_play）")
         print("  - POST /api/ppt/stop_auto_play # 停止自动翻页")
         print("  - POST /api/ppt/exit_show      # 退出放映模式")
         print()
